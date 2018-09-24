@@ -101,11 +101,11 @@ class VRPSolver:
     def _internal_impact(self, u, feasible_insertion_points):
         return self._global_disturbance(u, feasible_insertion_points)
 
-    def _own_impact(self, u, feasible_insertion_points):
+    def _own_impact(self, u, insertion_point):
         #return self.arrival[u] - self.opened[u]
         return 0.0
 
-    def _external_impact(self, u, feasible_insertion_points):
+    def _external_impact(self, u):
         if self.current_cluster.shape[0] == 1:
             return 0.0
         non_routed_points = self.current_cluster.query('index != @u')
@@ -121,10 +121,13 @@ class VRPSolver:
         bi = be = 1 / 2
         feasible_insertion_points = [(i, j) for i, j in possible_insertions
                                      if self._is_feasible_insertion(u, i, j)]
+        if len(feasible_insertion_points) == 0:
+            return float('inf'), 0
+
         internal_impact, insertion_point = self._internal_impact(u, feasible_insertion_points)
         weighted_internal_impact = bi * internal_impact
-        weighted_own_impact = bo * self._own_impact(u, feasible_insertion_points)
-        weighted_external_impact = be * self._external_impact(u, feasible_insertion_points)
+        weighted_own_impact = bo * self._own_impact(u, insertion_point)
+        weighted_external_impact = be * self._external_impact(u)
         return weighted_internal_impact + weighted_own_impact + weighted_external_impact, insertion_point
 
     def _cost_function(self, route):
@@ -140,10 +143,66 @@ class VRPSolver:
         return candidates.ready_time.idxmin()
 
     def _insert_client(self, client, insertion_point):
+        prev_client = 0
         for i, c in enumerate(self.current_route):
             if c == insertion_point:
                 self.current_route.insert(i + 1, client)
+                prev_client = c
                 break
+        self.arrival[client] = np.max([self._unload_and_move(prev_client, client), self.opened[client]])
+
+    def _route_cost(self, route):
+        roads = joblib.Parallel(n_jobs=self.n_jobs)(
+            joblib.delayed(tuple)([customer, route[i + 1]]) for i, customer in enumerate(route[:-1])
+        )
+        return sum((self.dist(i, j) for i, j in roads))
+
+    def solution_cost(self, sln):
+        return sum(map(self._route_cost, sln))
+
+    def _each_customer_is_served(self, sln):
+        from functools import reduce
+        return len(reduce(lambda x, y: x.union(y), map(set, sln))) == self.df.shape[0]
+
+    def _each_vehicle_is_not_overloaded(self, sln):
+        def vehicle_is_not_overloaded(clients):
+            return self.demand[clients].sum() <= self.vehicle_capacity
+        return all(map(vehicle_is_not_overloaded, sln))
+
+    def _vehicle_count_is_lesser_than_available(self, sln):
+        return len(sln) <= self.vehicle_number
+
+    def _all_unloads_in_correct_time_window(self, sln):
+        return all([self.opened[c] <= self.arrival[c] < self.closed[c] for route in sln for c in route[:-1]])
+
+    def _vehicles_is_not_late_in_depot(self, sln):
+        return all([self.opened[route[-1]]
+                    <= self.arrival[route[-2]] + self.service[route[-2]] + self.dist(route[-2], route[-1])
+                    < self.closed[route[-1]] for route in sln])
+
+    def is_solution_feasible(self, sln):
+        is_feasible = True
+        each_customer_is_served = self._each_customer_is_served(sln)
+        if not each_customer_is_served:
+            is_feasible = False
+            print("each_customer_is_served = False")
+        each_vehicle_is_not_overloaded = self._each_vehicle_is_not_overloaded(sln)
+        if not each_vehicle_is_not_overloaded:
+            is_feasible = False
+            print("each_vehicle_is_not_overloaded = False")
+        vehicle_count_is_lesser_than_available = self._vehicle_count_is_lesser_than_available(sln)
+        if not vehicle_count_is_lesser_than_available:
+            is_feasible = False
+            print("vehicle_count_is_lesser_than_available = False")
+        all_unloads_in_correct_time_window = self._all_unloads_in_correct_time_window(sln)
+        if not all_unloads_in_correct_time_window:
+            is_feasible = False
+            print("all_unloads_in_correct_time_window = False")
+        vehicles_is_not_late_in_depot = self._vehicles_is_not_late_in_depot(sln)
+        if not vehicles_is_not_late_in_depot:
+            is_feasible = False
+            print("vehicles_is_not_late_in_depot = False")
+        return is_feasible
 
     def get_initial_solution(self):
         def tupled(y, func, kwargs):
@@ -167,19 +226,17 @@ class VRPSolver:
                         joblib.delayed(tupled)(candidate, self._impact, (candidate, insertion_points))
                         for candidate in self.current_cluster.index
                     )
-                    #insertion_candidates_impact = [(candidate, self._impact(candidate, insertion_points))
-                    #                               for candidate in self.current_cluster.index]
                     chosen_one, (_, insertion_point) = min(insertion_candidates_impact, key=lambda x: x[1][0])
                     self._insert_client(chosen_one, insertion_point)
                     self.current_cluster.query('index != @chosen_one', inplace=True)
             self.solution.append(self.current_route)
             self.current_cluster = None
             self.current_route = list()
-        return len(self.solution), self.solution
+        return len(self.solution), self.solution, self.solution_cost(self.solution)
 
 
 if __name__ == "__main__":
     instances = glob.glob('./instances/*.txt')
     slv = VRPSolver(instances[0], n_jobs=8)
-    a, b = slv.get_initial_solution()
-    print(a, b)
+    n_vehicles, solution, cost = slv.get_initial_solution()
+    print(n_vehicles, solution, cost, slv.is_solution_feasible(solution))
