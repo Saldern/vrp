@@ -85,25 +85,53 @@ class VRPSolver:
         return np.max([self._unload_and_move(i, u), self.opened[u]])
 
     def _is_feasible_insertion(self, u, i, j):
-        arrival_u = self._possible_arrival(u, i)
-        is_feasible = arrival_u + self.service[u] + self.dist(u, j) < self.closed[j]
-        return is_feasible
+        if self._current_demand() + self.demand[u] > self.vehicle_capacity:
+            return False
 
-    def _global_disturbance(self, u, feasible_insertion_points):
+        arrival_u = self._possible_arrival(u, i)
+        late_arrival = arrival_u >= self.closed[u]
+        if late_arrival:
+            return False
+
+        insertion_index = 0
+        for idx, client in self.current_route:
+            if client == i:
+                insertion_index = idx
+                break
+
+        is_feasible =  < self.closed[j]
+        if not is_feasible:
+            return False
+        next_arrival = np.max([arrival_u + self.service[u] + self.dist(u, j), self.opened[j]])
+        if next_arrival >= self.closed[j]:
+            return False
+
+        for idx, client in self.current_route[insertion_index+1:-1]:
+            next_client = self.current_route[idx+1]
+            next_arrival = np.max([next_arrival + self.service[client] + self.dist(client, next_client),
+                                   self.opened[next_client]])
+            if next_arrival >= self.closed[next_client]:
+                return False
+        return True
+
+    def _global_disturbance(self, u, feasible_insertion_points, verbose):
         local_disturbances = [(i, self._local_disturbance(u, i, j)) for i, j in feasible_insertion_points]
+        if verbose > 0:
+            print("===== Local disturbance =====")
+            for i, j in local_disturbances:
+                print('    after {} = {}'.format(i, j))
         insertion_point = local_disturbances[np.argmin(local_disturbances, axis=0)[1]][0]
         mean_disturbance = np.sum(local_disturbances, axis=0)[1] / len(local_disturbances)
+        if verbose > 0:
+            print('Minimal disturbance is {:.2f} at {}'.format(np.min(local_disturbances, axis=0)[1], insertion_point))
         return mean_disturbance, insertion_point
 
-    def _accessibility(self, u, feasible_insertion_points):
-        return 1 / self._global_disturbance(u, feasible_insertion_points)
-
-    def _internal_impact(self, u, feasible_insertion_points):
-        return self._global_disturbance(u, feasible_insertion_points)
+    def _internal_impact(self, u, feasible_insertion_points, verbose):
+        return self._global_disturbance(u, feasible_insertion_points, verbose)
 
     def _own_impact(self, u, insertion_point):
-        #return self.arrival[u] - self.opened[u]
-        return 0.0
+        own_impact = self._unload_and_move(insertion_point, u) - self.opened[u]
+        return own_impact
 
     def _external_impact(self, u):
         if self.current_cluster.shape[0] == 1:
@@ -116,15 +144,21 @@ class VRPSolver:
             ]), axis=1).sum()
         return external_impact
 
-    def _impact(self, u, possible_insertions):
-        bo = 0.0
-        bi = be = 1 / 2
+    def _impact(self, u, possible_insertions, verbose):
+        bo = 0.33
+        bi = 0.33
+        be = 0.33
         feasible_insertion_points = [(i, j) for i, j in possible_insertions
                                      if self._is_feasible_insertion(u, i, j)]
+        if verbose > 0:
+            print('Client {}'.format(u))
+            print("===== Feasible insertions =====")
+            for i, j in feasible_insertion_points:
+                print('    between {} and {}'. format(i, j))
         if len(feasible_insertion_points) == 0:
-            return float('inf'), 0
+            return float('inf'), -1
 
-        internal_impact, insertion_point = self._internal_impact(u, feasible_insertion_points)
+        internal_impact, insertion_point = self._internal_impact(u, feasible_insertion_points, verbose)
         weighted_internal_impact = bi * internal_impact
         weighted_own_impact = bo * self._own_impact(u, insertion_point)
         weighted_external_impact = be * self._external_impact(u)
@@ -133,23 +167,22 @@ class VRPSolver:
     def _cost_function(self, route):
         return np.sum(self.dist(client, route[i + 1]) for i, client in enumerate(route[:-1]))
 
-    def _check_route(self, route):
-        assert route[0] == 0, "Route doesn't start at depot"
-        assert route[-1] == 0, "Route doesn't end in depot"
-        is_not_overloaded = np.sum((self.demand[i] for i in route)) <= self.vehicle_capacity
-        return is_not_overloaded
+    def _current_demand(self):
+        return np.sum([self.demand[i] for i in self.current_route])
 
     def _pick_seed_customer(self, candidates):
         return candidates.ready_time.idxmin()
 
     def _insert_client(self, client, insertion_point):
-        prev_client = 0
+        insertion_index = 0
         for i, c in enumerate(self.current_route):
             if c == insertion_point:
-                self.current_route.insert(i + 1, client)
-                prev_client = c
+                insertion_index = i
+                self.current_route.insert(insertion_index + 1, client)
                 break
-        self.arrival[client] = np.max([self._unload_and_move(prev_client, client), self.opened[client]])
+        for i, client in enumerate(self.current_route[insertion_index:-2]):
+            next_client = self.current_route[insertion_index:][i+1]
+            self.arrival[next_client] = np.max([self._unload_and_move(client, next_client), self.opened[next_client]])
 
     def _route_cost(self, route):
         roads = joblib.Parallel(n_jobs=self.n_jobs)(
@@ -204,39 +237,81 @@ class VRPSolver:
             print("vehicles_is_not_late_in_depot = False")
         return is_feasible
 
-    def get_initial_solution(self):
+    def _init_route(self, cluster_i):
+        self.current_route.append(0)
+        self.current_cluster = self.df.query('cluster == @cluster_i and index != "0"')
+        seed = self._pick_seed_customer(self.current_cluster)
+        self.current_route.append(seed)
+        self.arrival[seed] = np.max([self.dist(0, seed), self.opened[seed]])
+        self.current_route.append(0)
+        self.current_cluster.query('index != @seed', inplace=True)
+
+    def _close_route(self):
+        self.solution.append(self.current_route)
+        self.current_cluster = None
+        self.current_route = list()
+
+    def get_initial_solution(self, verbose=0):
         def tupled(y, func, kwargs):
             return tuple([y, func(*kwargs)])
 
-        for cluster_i in self.df.cluster.unique():
-            self.current_route.append(0)
-            self.current_cluster = self.df.query('cluster == @cluster_i and index != "0"')
-            seed = self._pick_seed_customer(self.current_cluster)
-            self.current_route.append(seed)
-            self.arrival[seed] = np.max([self.dist(0, seed), self.opened[seed]])
-            self.current_route.append(0)
-            self.current_cluster.query('index != @seed', inplace=True)
-            with joblib.Parallel(n_jobs=self.n_jobs) as parallel:
-                while self.current_cluster.shape[0] != 0 and self._check_route(self.current_route):
+        with joblib.Parallel(n_jobs=self.n_jobs) as parallel:
+            for cluster_i in self.df.cluster.unique():
+                while self.current_cluster.shape[0] != 0:
+                    self._init_route(cluster_i)
                     insertion_points = parallel(
                         joblib.delayed(tuple)([customer, self.current_route[i + 1]]) for i, customer in
                         enumerate(self.current_route[:-1])
                     )
                     insertion_candidates_impact = parallel(
-                        joblib.delayed(tupled)(candidate, self._impact, (candidate, insertion_points))
+                        joblib.delayed(tupled)(candidate, self._impact, (candidate, insertion_points, verbose))
                         for candidate in self.current_cluster.index
                     )
-                    chosen_one, (_, insertion_point) = min(insertion_candidates_impact, key=lambda x: x[1][0])
-                    self._insert_client(chosen_one, insertion_point)
-                    self.current_cluster.query('index != @chosen_one', inplace=True)
-            self.solution.append(self.current_route)
-            self.current_cluster = None
-            self.current_route = list()
-        return len(self.solution), self.solution, self.solution_cost(self.solution)
+                    insertion_candidates_impact = [(c, i, point) for c, (i, point)
+                                                   in insertion_candidates_impact if point != -1]
+                    while len(insertion_candidates_impact) != 0:
+                        if verbose > 0:
+                            print('===== Candidates: =====')
+                            for client, (impact, insert_after) \
+                                    in sorted(insertion_candidates_impact, key=lambda x: x[1][0]):
+                                print('Client {} (openned: {}, closed: {}), impact={}, insert after {}'.format(
+                                    client, self.opened[client], self.closed[client], impact, insert_after))
+                            print()
+                            print('===== Current route: =====')
+                            print('->'.join([str(i) for i in self.current_route]))
+                            print('===== Arrival =====')
+                            print('->'.join(['{:.1f}'.format(self.arrival[i]) for i in self.current_route]))
+                            print('===== Closed =====')
+                            print('->'.join(['{:.0f}'.format(self.closed[i]) for i in self.current_route]))
+
+                        chosen_one, _, insertion_point = min(insertion_candidates_impact, key=lambda x: self.opened[x[0]])
+                        self._insert_client(chosen_one, insertion_point)
+                        self.current_cluster.query('index != @chosen_one', inplace=True)
+                        if verbose > 0:
+                            print()
+                            print('===== Route after insert: =====')
+                            print('->'.join([str(i) for i in self.current_route]))
+                            print('===== Arrival =====')
+                            print('->'.join(['{:.1f}'.format(self.arrival[i]) for i in self.current_route]))
+                            print('===== Closed =====')
+                            print('->'.join(['{:.0f}'.format(self.closed[i]) for i in self.current_route]))
+                        insertion_points = parallel(
+                            joblib.delayed(tuple)([customer, self.current_route[i + 1]]) for i, customer in
+                            enumerate(self.current_route[:-1])
+                        )
+                        insertion_candidates_impact = parallel(
+                            joblib.delayed(tupled)(candidate, self._impact, (candidate, insertion_points, verbose))
+                            for candidate in self.current_cluster.index
+                        )
+                        insertion_candidates_impact = [(c, i, point) for c, (i, point)
+                                                       in insertion_candidates_impact if point != -1]
+                    self._close_route()
+
+            return len(self.solution), self.solution, self.solution_cost(self.solution)
 
 
 if __name__ == "__main__":
     instances = glob.glob('./instances/*.txt')
     slv = VRPSolver(instances[0], n_jobs=8)
-    n_vehicles, solution, cost = slv.get_initial_solution()
+    n_vehicles, solution, cost = slv.get_initial_solution(1)
     print(n_vehicles, solution, cost, slv.is_solution_feasible(solution))
