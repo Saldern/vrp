@@ -188,14 +188,14 @@ class VRPSolver:
             next_client = self.current_route[insertion_index:][i+1]
             self.arrival[next_client] = np.max([self._unload_and_move(client, next_client), self.opened[next_client]])
 
-    def _route_cost(self, route):
+    def route_cost(self, route):
         roads = joblib.Parallel(n_jobs=self.n_jobs)(
             joblib.delayed(tuple)([customer, route[i + 1]]) for i, customer in enumerate(route[:-1])
         )
         return sum((self.dist(i, j) for i, j in roads))
 
     def solution_cost(self, sln):
-        return sum(map(self._route_cost, sln))
+        return sum(map(self.route_cost, sln))
 
     def _each_customer_is_served(self, sln):
         from functools import reduce
@@ -244,6 +244,7 @@ class VRPSolver:
     def _init_route(self, cluster_i):
         self.current_route.append(0)
         seed = self._pick_seed_customer(self.current_cluster)
+        self.routed_clients.append(seed)
         self.current_route.append(seed)
         self.arrival[seed] = np.max([self.dist(0, seed), self.opened[seed]])
         self.current_route.append(0)
@@ -260,6 +261,9 @@ class VRPSolver:
 
         with joblib.Parallel(n_jobs=self.n_jobs) as parallel:
             for cluster_i in self.df.cluster.unique():
+                if cluster_i == self.df.cluster.max():
+                    self.routed_clients.append(0)
+                    continue
                 routed_clients = self.routed_clients
                 self.current_cluster = self.df.query(
                     'cluster == @cluster_i and index != "0" and index not in @routed_clients')
