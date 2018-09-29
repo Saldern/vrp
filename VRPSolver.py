@@ -25,10 +25,12 @@ class VRPSolver:
         self.service = self.df.loc[:, 'service_time']
         self.demand = self.df.loc[:, 'demand']
         self.current_cluster = None
+        self.routed_clients = list()
 
         kmc = KMeans(n_clusters, n_jobs=self.n_jobs)
         coords = self.df.loc[:, ['xcoord', 'ycoord']]
         self.df['cluster'] = kmc.fit_predict(coords)
+        self.df.loc[0, 'cluster'] = n_clusters
 
     def read_data(self, filepath):
         with open(filepath, 'r') as f:
@@ -94,20 +96,21 @@ class VRPSolver:
             return False
 
         insertion_index = 0
-        for idx, client in self.current_route:
+        for idx, client in enumerate(self.current_route):
             if client == i:
                 insertion_index = idx
                 break
 
-        is_feasible =  < self.closed[j]
-        if not is_feasible:
-            return False
+        #is_feasible =  < self.closed[j]
+        #if not is_feasible:
+        #    return False
         next_arrival = np.max([arrival_u + self.service[u] + self.dist(u, j), self.opened[j]])
         if next_arrival >= self.closed[j]:
             return False
 
-        for idx, client in self.current_route[insertion_index+1:-1]:
-            next_client = self.current_route[idx+1]
+        rest_of_the_route = self.current_route[insertion_index+1:]
+        for idx, client in enumerate(rest_of_the_route[:-1]):
+            next_client = rest_of_the_route[idx+1]
             next_arrival = np.max([next_arrival + self.service[client] + self.dist(client, next_client),
                                    self.opened[next_client]])
             if next_arrival >= self.closed[next_client]:
@@ -174,6 +177,7 @@ class VRPSolver:
         return candidates.ready_time.idxmin()
 
     def _insert_client(self, client, insertion_point):
+        self.routed_clients.append(client)
         insertion_index = 0
         for i, c in enumerate(self.current_route):
             if c == insertion_point:
@@ -239,7 +243,6 @@ class VRPSolver:
 
     def _init_route(self, cluster_i):
         self.current_route.append(0)
-        self.current_cluster = self.df.query('cluster == @cluster_i and index != "0"')
         seed = self._pick_seed_customer(self.current_cluster)
         self.current_route.append(seed)
         self.arrival[seed] = np.max([self.dist(0, seed), self.opened[seed]])
@@ -247,8 +250,8 @@ class VRPSolver:
         self.current_cluster.query('index != @seed', inplace=True)
 
     def _close_route(self):
+        print("add route", self.current_route)
         self.solution.append(self.current_route)
-        self.current_cluster = None
         self.current_route = list()
 
     def get_initial_solution(self, verbose=0):
@@ -257,6 +260,9 @@ class VRPSolver:
 
         with joblib.Parallel(n_jobs=self.n_jobs) as parallel:
             for cluster_i in self.df.cluster.unique():
+                routed_clients = self.routed_clients
+                self.current_cluster = self.df.query(
+                    'cluster == @cluster_i and index != "0" and index not in @routed_clients')
                 while self.current_cluster.shape[0] != 0:
                     self._init_route(cluster_i)
                     insertion_points = parallel(
@@ -267,13 +273,18 @@ class VRPSolver:
                         joblib.delayed(tupled)(candidate, self._impact, (candidate, insertion_points, verbose))
                         for candidate in self.current_cluster.index
                     )
+                    # non parallel version
+                    # insertion_candidates_impact = [
+                    #     (candidate, self._impact(candidate, insertion_points, verbose))
+                    #     for candidate in self.current_cluster.index
+                    # ]
                     insertion_candidates_impact = [(c, i, point) for c, (i, point)
                                                    in insertion_candidates_impact if point != -1]
                     while len(insertion_candidates_impact) != 0:
                         if verbose > 0:
                             print('===== Candidates: =====')
-                            for client, (impact, insert_after) \
-                                    in sorted(insertion_candidates_impact, key=lambda x: x[1][0]):
+                            for (client, impact, insert_after) \
+                                    in sorted(insertion_candidates_impact, key=lambda x: x[1]):
                                 print('Client {} (openned: {}, closed: {}), impact={}, insert after {}'.format(
                                     client, self.opened[client], self.closed[client], impact, insert_after))
                             print()
@@ -284,7 +295,7 @@ class VRPSolver:
                             print('===== Closed =====')
                             print('->'.join(['{:.0f}'.format(self.closed[i]) for i in self.current_route]))
 
-                        chosen_one, _, insertion_point = min(insertion_candidates_impact, key=lambda x: self.opened[x[0]])
+                        chosen_one, _, insertion_point = min(insertion_candidates_impact, key=lambda x: x[1])
                         self._insert_client(chosen_one, insertion_point)
                         self.current_cluster.query('index != @chosen_one', inplace=True)
                         if verbose > 0:
@@ -313,5 +324,5 @@ class VRPSolver:
 if __name__ == "__main__":
     instances = glob.glob('./instances/*.txt')
     slv = VRPSolver(instances[0], n_jobs=8)
-    n_vehicles, solution, cost = slv.get_initial_solution(1)
-    print(n_vehicles, solution, cost, slv.is_solution_feasible(solution))
+    n_vehicles, solution, cost = slv.get_initial_solution(0)
+    print(n_vehicles, cost, slv.is_solution_feasible(solution))
