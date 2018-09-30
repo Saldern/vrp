@@ -7,8 +7,9 @@ from sklearn.cluster import KMeans
 
 
 class VRPSolver:
-    def __init__(self, instance, n_clusters=10, n_jobs=1):
+    def __init__(self, instance, n_clusters=None, n_jobs=1):
         self.name, self.vehicle_number, self.vehicle_capacity, columns_names, lines = self.read_data(instance)
+        self.n_clusters = n_clusters
         self.df = pd.DataFrame(data=lines, columns=columns_names, dtype=int).set_index('cust_no')
         self.distances = None
         self.n_jobs = n_jobs
@@ -27,10 +28,22 @@ class VRPSolver:
         self.current_cluster = None
         self.routed_clients = list()
 
-        kmc = KMeans(n_clusters, n_jobs=self.n_jobs)
+        self.df['cluster'] = 0
         coords = self.df.loc[:, ['xcoord', 'ycoord']]
+        if self.n_clusters is None:
+            self.n_clusters = 8
+            while self.df.groupby('cluster').demand.sum().max() > self.vehicle_capacity:
+                self.n_clusters += 3
+                kmc = KMeans(self.n_clusters, n_jobs=self.n_jobs)
+                self.df['cluster'] = kmc.fit_predict(coords)
+            while self.df.groupby('cluster').demand.sum().max() <= self.vehicle_capacity:
+                self.n_clusters -= 1
+                kmc = KMeans(self.n_clusters, n_jobs=self.n_jobs)
+                self.df['cluster'] = kmc.fit_predict(coords)
+            self.n_clusters += 1
+        kmc = KMeans(self.n_clusters, n_jobs=self.n_jobs)
         self.df['cluster'] = kmc.fit_predict(coords)
-        self.df.loc[0, 'cluster'] = n_clusters
+        self.df.loc[0, 'cluster'] = self.n_clusters
 
     def read_data(self, filepath):
         with open(filepath, 'r') as f:
@@ -101,9 +114,6 @@ class VRPSolver:
                 insertion_index = idx
                 break
 
-        #is_feasible =  < self.closed[j]
-        #if not is_feasible:
-        #    return False
         next_arrival = np.max([arrival_u + self.service[u] + self.dist(u, j), self.opened[j]])
         if next_arrival >= self.closed[j]:
             return False
@@ -176,6 +186,15 @@ class VRPSolver:
     def _pick_seed_customer(self, candidates):
         return candidates.ready_time.idxmin()
 
+    def recount_arrivals(self, solution):
+        for route in solution:
+            self.arrival[0] = 0.0
+            for i, client in enumerate(route[:-2]):
+                next_client = route[i+1]
+                self.arrival[next_client] = np.max([self._unload_and_move(client, next_client),
+                                                    self.opened[next_client]])
+
+
     def _insert_client(self, client, insertion_point):
         self.routed_clients.append(client)
         insertion_index = 0
@@ -201,13 +220,23 @@ class VRPSolver:
         from functools import reduce
         return len(reduce(lambda x, y: x.union(y), map(set, sln))) == self.df.shape[0]
 
+    def vehicle_is_not_overloaded(self, clients):
+        return self.demand[clients].sum() <= self.vehicle_capacity
+
     def _each_vehicle_is_not_overloaded(self, sln):
-        def vehicle_is_not_overloaded(clients):
-            return self.demand[clients].sum() <= self.vehicle_capacity
-        return all(map(vehicle_is_not_overloaded, sln))
+        return all(map(self.vehicle_is_not_overloaded, sln))
 
     def _vehicle_count_is_lesser_than_available(self, sln):
         return len(sln) <= self.vehicle_number
+
+    def check_time_windows(self, route):
+        return all([self.opened[c] <= self.arrival[c] < self.closed[c] for c in route[:-1]])
+
+    def check_late_to_depot(self, route):
+        depot = route[-1]
+        last_client = route[-2]
+        return (self.opened[depot] <= self.arrival[last_client] + self.service[last_client]
+                + self.dist(last_client, depot) < self.closed[depot])
 
     def _all_unloads_in_correct_time_window(self, sln):
         return all([self.opened[c] <= self.arrival[c] < self.closed[c] for route in sln for c in route[:-1]])
@@ -222,23 +251,23 @@ class VRPSolver:
         each_customer_is_served = self._each_customer_is_served(sln)
         if not each_customer_is_served:
             is_feasible = False
-            print("each_customer_is_served = False")
+            #print("each_customer_is_served = False")
         each_vehicle_is_not_overloaded = self._each_vehicle_is_not_overloaded(sln)
         if not each_vehicle_is_not_overloaded:
             is_feasible = False
-            print("each_vehicle_is_not_overloaded = False")
+            #print("each_vehicle_is_not_overloaded = False")
         vehicle_count_is_lesser_than_available = self._vehicle_count_is_lesser_than_available(sln)
         if not vehicle_count_is_lesser_than_available:
             is_feasible = False
-            print("vehicle_count_is_lesser_than_available = False")
+            #print("vehicle_count_is_lesser_than_available = False")
         all_unloads_in_correct_time_window = self._all_unloads_in_correct_time_window(sln)
         if not all_unloads_in_correct_time_window:
             is_feasible = False
-            print("all_unloads_in_correct_time_window = False")
+            #print("all_unloads_in_correct_time_window = False")
         vehicles_is_not_late_in_depot = self._vehicles_is_not_late_in_depot(sln)
         if not vehicles_is_not_late_in_depot:
             is_feasible = False
-            print("vehicles_is_not_late_in_depot = False")
+            #print("vehicles_is_not_late_in_depot = False")
         return is_feasible
 
     def _init_route(self, cluster_i):
@@ -251,7 +280,7 @@ class VRPSolver:
         self.current_cluster.query('index != @seed', inplace=True)
 
     def _close_route(self):
-        print("add route", self.current_route)
+        # print("add route", self.current_route)
         self.solution.append(self.current_route)
         self.current_route = list()
 
